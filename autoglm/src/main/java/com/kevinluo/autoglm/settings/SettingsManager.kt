@@ -7,6 +7,7 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.kevinluo.autoglm.agent.AgentConfig
 import com.kevinluo.autoglm.model.ModelConfig
+import com.kevinluo.autoglm.planner.PlannerConfig
 import com.kevinluo.autoglm.util.Logger
 import org.json.JSONArray
 import org.json.JSONObject
@@ -92,6 +93,16 @@ class SettingsManager private constructor(private val context: Context) {
         private const val KEY_VERBOSE = "agent_verbose"
         private const val KEY_SCREENSHOT_DELAY_MS = "agent_screenshot_delay_ms"
 
+        // PlannerConfig keys (DeepSeek planner)
+        private const val KEY_PLANNER_ENABLED = "planner_enabled"
+        private const val KEY_PLANNER_BASE_URL = "planner_base_url"
+        private const val KEY_PLANNER_API_KEY = "planner_api_key"
+        private const val KEY_PLANNER_MODEL_NAME = "planner_model_name"
+        private const val KEY_PLANNER_TEMPERATURE = "planner_temperature"
+        private const val KEY_PLANNER_MAX_TURNS = "planner_max_turns"
+        private const val KEY_PLANNER_POLL_INTERVAL_MS = "planner_poll_interval_ms"
+        private const val KEY_PLANNER_TIMEOUT_MS = "planner_timeout_ms"
+
         // Saved model profiles keys
         private const val KEY_SAVED_PROFILES = "saved_model_profiles"
         private const val KEY_CURRENT_PROFILE_ID = "current_profile_id"
@@ -114,6 +125,7 @@ class SettingsManager private constructor(private val context: Context) {
         // Default values
         private val DEFAULT_MODEL_CONFIG = ModelConfig()
         private val DEFAULT_AGENT_CONFIG = AgentConfig()
+        private val DEFAULT_PLANNER_CONFIG = PlannerConfig()
     }
 
     // Cache for detecting config changes
@@ -255,6 +267,66 @@ class SettingsManager private constructor(private val context: Context) {
             putString(KEY_LANGUAGE, config.language)
             putBoolean(KEY_VERBOSE, config.verbose)
             putLong(KEY_SCREENSHOT_DELAY_MS, config.screenshotDelayMs)
+            apply()
+        }
+    }
+
+    /**
+     * Gets the current PlannerConfig from storage.
+     *
+     * Returns default values if not previously saved.
+     *
+     * @return The current planner configuration
+     *
+     */
+    fun getPlannerConfig(): PlannerConfig {
+        Logger.d(TAG, "Loading planner configuration")
+        return PlannerConfig(
+            enabled = prefs.getBoolean(KEY_PLANNER_ENABLED, DEFAULT_PLANNER_CONFIG.enabled),
+            baseUrl =
+                prefs.getString(KEY_PLANNER_BASE_URL, DEFAULT_PLANNER_CONFIG.baseUrl)
+                    ?: DEFAULT_PLANNER_CONFIG.baseUrl,
+            apiKey =
+                securePrefs
+                    .getString(KEY_PLANNER_API_KEY, DEFAULT_PLANNER_CONFIG.apiKey)
+                    ?.ifEmpty { "EMPTY" } ?: "EMPTY",
+            modelName =
+                prefs.getString(KEY_PLANNER_MODEL_NAME, DEFAULT_PLANNER_CONFIG.modelName)
+                    ?: DEFAULT_PLANNER_CONFIG.modelName,
+            temperature = prefs.getFloat(KEY_PLANNER_TEMPERATURE, DEFAULT_PLANNER_CONFIG.temperature),
+            maxPlannerTurns = prefs.getInt(KEY_PLANNER_MAX_TURNS, DEFAULT_PLANNER_CONFIG.maxPlannerTurns),
+            pollIntervalMs = prefs.getLong(KEY_PLANNER_POLL_INTERVAL_MS, DEFAULT_PLANNER_CONFIG.pollIntervalMs),
+            timeoutMs = prefs.getLong(KEY_PLANNER_TIMEOUT_MS, DEFAULT_PLANNER_CONFIG.timeoutMs),
+        )
+    }
+
+    /**
+     * Saves the PlannerConfig to storage.
+     *
+     * API Key is stored in encrypted preferences for security.
+     * Other settings are stored in regular preferences.
+     *
+     * @param config The planner configuration to save
+     *
+     */
+    fun savePlannerConfig(config: PlannerConfig) {
+        Logger.d(TAG, "Saving planner configuration: enabled=${config.enabled}, baseUrl=${config.baseUrl}, modelName=${config.modelName}")
+
+        // Save non-sensitive data to regular prefs
+        prefs.edit().apply {
+            putBoolean(KEY_PLANNER_ENABLED, config.enabled)
+            putString(KEY_PLANNER_BASE_URL, config.baseUrl)
+            putString(KEY_PLANNER_MODEL_NAME, config.modelName)
+            putFloat(KEY_PLANNER_TEMPERATURE, config.temperature)
+            putInt(KEY_PLANNER_MAX_TURNS, config.maxPlannerTurns)
+            putLong(KEY_PLANNER_POLL_INTERVAL_MS, config.pollIntervalMs)
+            putLong(KEY_PLANNER_TIMEOUT_MS, config.timeoutMs)
+            apply()
+        }
+
+        // Save API Key to encrypted prefs
+        securePrefs.edit().apply {
+            putString(KEY_PLANNER_API_KEY, config.apiKey)
             apply()
         }
     }

@@ -9,6 +9,7 @@ import com.kevinluo.autoglm.config.SystemPrompts
 import com.kevinluo.autoglm.history.HistoryManager
 import com.kevinluo.autoglm.model.ModelClient
 import com.kevinluo.autoglm.model.ModelResult
+import com.kevinluo.autoglm.planner.PlannerOrchestrator
 import com.kevinluo.autoglm.screenshot.ScreenshotService
 import com.kevinluo.autoglm.util.ErrorHandler
 import com.kevinluo.autoglm.util.Logger
@@ -97,6 +98,9 @@ class PhoneAgent(
     private val screenshotService: ScreenshotService,
     private val config: AgentConfig = AgentConfig(),
     private val historyManager: HistoryManager? = null,
+
+    // NEW: DeepSeek planner orchestrator (optional)
+    private val plannerOrchestrator: PlannerOrchestrator? = null,
 ) {
     // Private properties
     private val context: AtomicReference<AgentContext?> = AtomicReference(null)
@@ -180,6 +184,7 @@ class PhoneAgent(
         if (compareAndSetState(AgentState.RUNNING, AgentState.PAUSED)) {
             // Cancel any ongoing model request immediately
             modelClient.cancelCurrentRequest()
+            plannerOrchestrator?.cancelCurrentRequest()
 
             // If action hasn't been executed yet, we'll retry this step when resumed
             // The step number will be decremented in executeStep when it detects pause
@@ -286,8 +291,7 @@ class PhoneAgent(
             while (config.maxSteps == 0 || stepCount < config.maxSteps) {
                 ensureActive()
 
-                val currentState = _state.value
-                if (currentState == AgentState.CANCELLED) {
+                if (_state.value == AgentState.CANCELLED) {
                     Logger.i(TAG, "Task cancelled by user at step $stepCount")
                     if (!historyCompleted) {
                         historyManager?.completeTask(false, cancellationMsg)
@@ -432,9 +436,12 @@ class PhoneAgent(
     /**
      * Executes a single step of the task.
      *
-     * @param task Optional task description (only needed for first step)
-     * @param hint Optional hint from previous step (e.g., app not found, need to search on screen)
-     * @return StepResult containing step outcome
+     * When plannerOrchestrator != null:
+     * - This step will ask planner for next DSL action and then execute it.
+     * - Screenshots are captured ONLY when planner decides they are needed (A1).
+     *
+     * When plannerOrchestrator == null:
+     * - Keeps old behavior: always capture screenshot and ask VLM directly.
      */
     private suspend fun executeStep(task: String?, hint: String? = null): StepResult {
         // Wait if paused (check at the beginning of each step)
@@ -461,192 +468,131 @@ class PhoneAgent(
 
         val cancellationMsg = getCancellationMessage()
 
-        try {
-            // Check cancellation before any operation
-            if (_state.value == AgentState.CANCELLED) {
-                Logger.i(TAG, "Task cancelled at start of step")
-                return StepResult(
-                    success = false,
-                    finished = true,
-                    action = null,
-                    thinking = "",
-                    message = cancellationMsg,
-                )
-            }
+        // Fast cancel check
+        if (_state.value == AgentState.CANCELLED) {
+            Logger.i(TAG, "Task cancelled at start of step")
+            return StepResult(
+                success = false,
+                finished = true,
+                action = null,
+                thinking = "",
+                message = cancellationMsg,
+            )
+        }
 
-            // Wait before capturing screenshot (configurable delay)
+        // Pause check
+        if (_state.value == AgentState.PAUSED) {
+            Logger.i(TAG, "Task paused at start of step, will retry step")
+            currentStepNumber--
+            return StepResult(
+                success = true,
+                finished = false,
+                action = null,
+                thinking = "",
+                message = PAUSE_MESSAGE,
+                paused = true,
+            )
+        }
+
+        return if (plannerOrchestrator != null) {
+            executeStepViaPlanner(plannerOrchestrator, task, hint, cancellationMsg)
+        } else {
+            executeStepViaVlmLegacy(ctx, task, hint, cancellationMsg)
+        }
+    }
+
+    /**
+     * Legacy mode: always take screenshot then call VLM directly (original behavior).
+     */
+    private suspend fun executeStepViaVlmLegacy(
+        ctx: AgentContext,
+        task: String?,
+        hint: String?,
+        cancellationMsg: String,
+    ): StepResult {
+        try {
             if (config.screenshotDelayMs > 0) {
                 Logger.d(TAG, "Waiting ${config.screenshotDelayMs}ms before screenshot...")
                 kotlinx.coroutines.delay(config.screenshotDelayMs)
             }
 
-            // Check cancellation after delay
             if (_state.value == AgentState.CANCELLED) {
                 Logger.i(TAG, "Task cancelled after screenshot delay")
-                return StepResult(
-                    success = false,
-                    finished = true,
-                    action = null,
-                    thinking = "",
-                    message = cancellationMsg,
-                )
+                return StepResult(false, true, null, "", cancellationMsg)
             }
-
-            // Check pause after delay - if paused, return to retry this step
             if (_state.value == AgentState.PAUSED) {
                 Logger.i(TAG, "Task paused before screenshot, will retry step")
-                currentStepNumber-- // Decrement so we retry this step
-                return StepResult(
-                    success = true,
-                    finished = false,
-                    action = null,
-                    thinking = "",
-                    message = PAUSE_MESSAGE,
-                    paused = true,
-                )
+                currentStepNumber--
+                return StepResult(true, false, null, "", PAUSE_MESSAGE, paused = true)
             }
 
-            // Capture screenshot
             Logger.d(TAG, "Capturing screenshot...")
             listener?.onScreenshotStarted()
             val screenshot = screenshotService.capture()
             listener?.onScreenshotCompleted()
             Logger.logScreenshot(screenshot.width, screenshot.height, screenshot.isSensitive)
 
-            // Check cancellation after screenshot
             if (_state.value == AgentState.CANCELLED) {
                 Logger.i(TAG, "Task cancelled after screenshot capture")
-                return StepResult(
-                    success = false,
-                    finished = true,
-                    action = null,
-                    thinking = "",
-                    message = cancellationMsg,
-                )
+                return StepResult(false, true, null, "", cancellationMsg)
             }
-
-            // Check pause after screenshot - if paused, discard screenshot and retry
             if (_state.value == AgentState.PAUSED) {
                 Logger.i(TAG, "Task paused after screenshot, will retry step with fresh screenshot")
-                currentStepNumber-- // Decrement so we retry this step
-                return StepResult(
-                    success = true,
-                    finished = false,
-                    action = null,
-                    thinking = "",
-                    message = PAUSE_MESSAGE,
-                    paused = true,
-                )
+                currentStepNumber--
+                return StepResult(true, false, null, "", PAUSE_MESSAGE, paused = true)
             }
 
-            // Store screenshot for history recording
             historyManager?.setCurrentScreenshot(screenshot.base64Data, screenshot.width, screenshot.height)
 
-            // Build user message
             val userText =
                 when {
                     task != null -> "任务: $task\n当前屏幕截图如下:"
                     hint != null -> "上一步执行结果: $hint\n继续执行任务，当前屏幕截图如下:"
                     else -> "继续执行任务，当前屏幕截图如下:"
                 }
-
-            // Add user message to context (screenshot is passed separately to model)
             ctx.addUserMessage(userText)
 
-            // Request model response with current screenshot
             Logger.d(TAG, "Requesting model response...")
-
             val modelResult = modelClient.request(ctx.getMessages(), screenshot.base64Data)
 
-            // Check if cancelled after request (request might have been interrupted)
             if (_state.value == AgentState.CANCELLED) {
                 Logger.i(TAG, "Task cancelled during/after model request")
-                return StepResult(
-                    success = false,
-                    finished = true,
-                    action = null,
-                    thinking = "",
-                    message = cancellationMsg,
-                )
+                return StepResult(false, true, null, "", cancellationMsg)
             }
-
-            // Check pause after model request - if paused, discard response and retry
             if (_state.value == AgentState.PAUSED) {
                 Logger.i(TAG, "Task paused during/after model request, will retry step")
-                currentStepNumber-- // Decrement so we retry this step
-                // Remove the user message we just added since we'll retry
+                currentStepNumber--
                 ctx.removeLastUserMessage()
-                return StepResult(
-                    success = true,
-                    finished = false,
-                    action = null,
-                    thinking = "",
-                    message = PAUSE_MESSAGE,
-                    paused = true,
-                )
+                return StepResult(true, false, null, "", PAUSE_MESSAGE, paused = true)
             }
 
-            when (modelResult) {
+            return when (modelResult) {
                 is ModelResult.Success -> {
                     val response = modelResult.response
                     Logger.logThinking(response.thinking)
                     Logger.logModelAction(response.action)
-
-                    // Update listener with thinking
                     listener?.onThinkingUpdate(response.thinking)
 
-                    // Check again if cancelled before processing action
                     if (_state.value == AgentState.CANCELLED) {
                         Logger.i(TAG, "Task cancelled before action execution")
-                        return StepResult(
-                            success = false,
-                            finished = true,
-                            action = null,
-                            thinking = response.thinking,
-                            message = cancellationMsg,
-                        )
+                        return StepResult(false, true, null, response.thinking, cancellationMsg)
                     }
-
-                    // Check pause before action execution - if paused, discard and retry
                     if (_state.value == AgentState.PAUSED) {
                         Logger.i(TAG, "Task paused before action execution, will retry step")
-                        currentStepNumber-- // Decrement so we retry this step
+                        currentStepNumber--
                         ctx.removeLastUserMessage()
-                        return StepResult(
-                            success = true,
-                            finished = false,
-                            action = null,
-                            thinking = response.thinking,
-                            message = PAUSE_MESSAGE,
-                            paused = true,
-                        )
+                        return StepResult(true, false, null, response.thinking, PAUSE_MESSAGE, paused = true)
                     }
 
-                    // Handle empty action with retry
                     if (response.action.isBlank()) {
                         val retryResult = retryForEmptyAction(ctx, screenshot.base64Data, response.thinking)
-
-                        // Check state after retry attempts
                         if (_state.value == AgentState.CANCELLED) {
-                            return StepResult(
-                                success = false,
-                                finished = true,
-                                action = null,
-                                thinking = retryResult?.thinking ?: response.thinking,
-                                message = cancellationMsg,
-                            )
+                            return StepResult(false, true, null, retryResult?.thinking ?: response.thinking, cancellationMsg)
                         }
                         if (_state.value == AgentState.PAUSED) {
                             currentStepNumber--
                             ctx.removeLastUserMessage()
-                            return StepResult(
-                                success = true,
-                                finished = false,
-                                action = null,
-                                thinking = retryResult?.thinking ?: response.thinking,
-                                message = PAUSE_MESSAGE,
-                                paused = true,
-                            )
+                            return StepResult(true, false, null, retryResult?.thinking ?: response.thinking, PAUSE_MESSAGE, paused = true)
                         }
 
                         if (retryResult == null) {
@@ -658,13 +604,7 @@ class PhoneAgent(
                                 success = false,
                                 message = "模型响应中没有操作（已重试${MAX_EMPTY_ACTION_RETRIES}次）",
                             )
-                            return StepResult(
-                                success = false,
-                                finished = false,
-                                action = null,
-                                thinking = response.thinking,
-                                message = "模型响应中没有操作（已重试${MAX_EMPTY_ACTION_RETRIES}次）",
-                            )
+                            return StepResult(false, false, null, response.thinking, "模型响应中没有操作（已重试${MAX_EMPTY_ACTION_RETRIES}次）")
                         }
 
                         return executeAction(
@@ -675,9 +615,8 @@ class PhoneAgent(
                         )
                     }
 
-                    // Action is not empty, add to context and execute
                     ctx.addAssistantMessage(response.rawContent)
-                    return executeAction(
+                    executeAction(
                         response.action,
                         response.thinking,
                         screenshot.originalWidth,
@@ -686,100 +625,170 @@ class PhoneAgent(
                 }
 
                 is ModelResult.Error -> {
-                    // Check if this error is due to cancellation
                     if (_state.value == AgentState.CANCELLED) {
                         Logger.i(TAG, "Task cancelled, ignoring model error")
-                        return StepResult(
-                            success = false,
-                            finished = true,
-                            action = null,
-                            thinking = "",
-                            message = cancellationMsg,
-                        )
-                    }
-
-                    // Check if this error is due to pause (request was cancelled)
-                    if (_state.value == AgentState.PAUSED) {
+                        StepResult(false, true, null, "", cancellationMsg)
+                    } else if (_state.value == AgentState.PAUSED) {
                         Logger.i(TAG, "Model request cancelled due to pause, will retry step")
-                        currentStepNumber-- // Decrement so we retry this step
-                        // Remove the user message we just added since we'll retry
+                        currentStepNumber--
                         ctx.removeLastUserMessage()
-                        return StepResult(
-                            success = true,
-                            finished = false,
-                            action = null,
+                        StepResult(true, false, null, "", PAUSE_MESSAGE, paused = true)
+                    } else {
+                        val handledError = ErrorHandler.handleNetworkError(modelResult.error)
+                        Logger.e(TAG, ErrorHandler.formatErrorForLog(handledError))
+                        historyManager?.recordStep(
+                            stepNumber = currentStepNumber,
                             thinking = "",
-                            message = PAUSE_MESSAGE,
-                            paused = true,
+                            action = null,
+                            actionDescription = "模型错误",
+                            success = false,
+                            message = handledError.userMessage,
                         )
+                        StepResult(false, false, null, "", handledError.userMessage)
                     }
-
-                    val handledError = ErrorHandler.handleNetworkError(modelResult.error)
-                    Logger.e(TAG, ErrorHandler.formatErrorForLog(handledError))
-                    // Record failed step
-                    historyManager?.recordStep(
-                        stepNumber = currentStepNumber,
-                        thinking = "",
-                        action = null,
-                        actionDescription = "模型错误",
-                        success = false,
-                        message = handledError.userMessage,
-                    )
-                    return StepResult(
-                        success = false,
-                        finished = false,
-                        action = null,
-                        thinking = "",
-                        message = handledError.userMessage,
-                    )
                 }
             }
         } catch (e: CancellationException) {
-            // Coroutine cancellation - always treat as user cancellation
             Logger.i(TAG, "Step cancelled via coroutine cancellation")
-            return StepResult(
-                success = false,
-                finished = true,
-                action = null,
-                thinking = "",
-                message = cancellationMsg,
-            )
+            return StepResult(false, true, null, "", cancellationMsg)
         } catch (e: Exception) {
-            // Check if exception is due to cancellation
             if (_state.value == AgentState.CANCELLED) {
                 Logger.i(TAG, "Task cancelled, exception ignored: ${e.message}")
-                return StepResult(
-                    success = false,
-                    finished = true,
-                    action = null,
-                    thinking = "",
-                    message = cancellationMsg,
-                )
+                return StepResult(false, true, null, "", cancellationMsg)
             }
-
-            // Check if exception is due to pause
             if (_state.value == AgentState.PAUSED) {
                 Logger.i(TAG, "Exception during paused state, will retry step: ${e.message}")
                 currentStepNumber--
+                return StepResult(true, false, null, "", PAUSE_MESSAGE, paused = true)
+            }
+            val handledError = ErrorHandler.handleUnknownError("Step execution error", e)
+            Logger.e(TAG, ErrorHandler.formatErrorForLog(handledError), e)
+            return StepResult(false, false, null, "", handledError.userMessage)
+        }
+    }
+
+    /**
+     * Planner mode: ask DeepSeek planner for next DSL, then execute.
+     *
+     * NOTE:
+     * - Planner internally decides whether to take screenshot / call VLM / run scripts.
+     * - Here we only execute the final DSL returned by planner.
+     */
+    private suspend fun executeStepViaPlanner(
+        planner: PlannerOrchestrator,
+        task: String?,
+        hint: String?,
+        cancellationMsg: String,
+    ): StepResult {
+        try {
+            // Optional delay before step (keeps existing behavior pacing)
+            if (config.screenshotDelayMs > 0) {
+                Logger.d(TAG, "Waiting ${config.screenshotDelayMs}ms before planner step...")
+                kotlinx.coroutines.delay(config.screenshotDelayMs)
+            }
+
+            if (_state.value == AgentState.CANCELLED) {
+                Logger.i(TAG, "Task cancelled before planner request")
+                return StepResult(false, true, null, "", cancellationMsg)
+            }
+            if (_state.value == AgentState.PAUSED) {
+                Logger.i(TAG, "Task paused before planner request, will retry step")
+                currentStepNumber--
+                return StepResult(true, false, null, "", PAUSE_MESSAGE, paused = true)
+            }
+
+            // Ask planner for next DSL action
+            val plannerOut = planner.planNext(
+                task = task ?: "continue",
+                hint = hint,
+            )
+
+            if (_state.value == AgentState.CANCELLED) {
+                Logger.i(TAG, "Task cancelled during/after planner request")
+                return StepResult(false, true, null, "", cancellationMsg)
+            }
+            if (_state.value == AgentState.PAUSED) {
+                Logger.i(TAG, "Task paused during/after planner request, will retry step")
+                currentStepNumber--
+                return StepResult(true, false, null, "", PAUSE_MESSAGE, paused = true)
+            }
+
+            // Planner might decide to answer directly (rare). Treat as finish.
+            if (plannerOut.plannerFinalAnswer != null) {
+                val msg = plannerOut.plannerFinalAnswer
+                historyManager?.recordStep(
+                    stepNumber = currentStepNumber,
+                    thinking = "",
+                    action = null,
+                    actionDescription = "planner_final",
+                    success = true,
+                    message = msg,
+                )
                 return StepResult(
                     success = true,
-                    finished = false,
+                    finished = true,
                     action = null,
                     thinking = "",
-                    message = PAUSE_MESSAGE,
-                    paused = true,
+                    message = msg,
                 )
             }
 
-            val handledError = ErrorHandler.handleUnknownError("Step execution error", e)
-            Logger.e(TAG, ErrorHandler.formatErrorForLog(handledError), e)
-            return StepResult(
-                success = false,
-                finished = false,
-                action = null,
-                thinking = "",
-                message = handledError.userMessage,
+            val actionDsl = plannerOut.nextActionDsl?.trim().orEmpty()
+            if (!plannerOut.ok || actionDsl.isBlank()) {
+                val err = plannerOut.debug ?: "Planner returned no action"
+                historyManager?.recordStep(
+                    stepNumber = currentStepNumber,
+                    thinking = "",
+                    action = null,
+                    actionDescription = "planner_error",
+                    success = false,
+                    message = err,
+                )
+                return StepResult(
+                    success = false,
+                    finished = false,
+                    action = null,
+                    thinking = "",
+                    message = err,
+                )
+            }
+
+            // Execute the DSL
+            // Since planner uses VLM for UI actions, DSL should be parseable by existing ActionParser.
+            // We still need screenWidth/Height; in legacy we used screenshot.originalWidth/Height.
+            // Here we capture a lightweight screenshot ONLY to get dimensions for coordinate scaling.
+            // (This does NOT go to model; it's just for executing 0-999 coords.)
+            listener?.onScreenshotStarted()
+            val screenshot = screenshotService.capture()
+            listener?.onScreenshotCompleted()
+
+            historyManager?.setCurrentScreenshot(screenshot.base64Data, screenshot.width, screenshot.height)
+
+            // No ctx.addUserMessage/assistantMessage here: planner owns its own conversation.
+            // But you can still save the DSL to history as "assistant" if you want.
+
+            return executeAction(
+                actionStr = actionDsl,
+                thinking = "", // plannerOut doesn't currently expose thinking; you can extend PlannerOrchestrator to include it.
+                screenWidth = screenshot.originalWidth,
+                screenHeight = screenshot.originalHeight,
             )
+        } catch (e: CancellationException) {
+            Logger.i(TAG, "Planner step cancelled via coroutine cancellation")
+            return StepResult(false, true, null, "", cancellationMsg)
+        } catch (e: Exception) {
+            if (_state.value == AgentState.CANCELLED) {
+                Logger.i(TAG, "Task cancelled, planner exception ignored: ${e.message}")
+                return StepResult(false, true, null, "", cancellationMsg)
+            }
+            if (_state.value == AgentState.PAUSED) {
+                Logger.i(TAG, "Planner exception during paused state, will retry step: ${e.message}")
+                currentStepNumber--
+                return StepResult(true, false, null, "", PAUSE_MESSAGE, paused = true)
+            }
+            val handledError = ErrorHandler.handleUnknownError("Planner step execution error", e)
+            Logger.e(TAG, ErrorHandler.formatErrorForLog(handledError), e)
+            return StepResult(false, false, null, "", handledError.userMessage)
         }
     }
 
@@ -1145,6 +1154,7 @@ Please re-analyze the current screenshot and output correct coordinates (within 
 
         // Cancel any ongoing model request
         modelClient.cancelCurrentRequest()
+        plannerOrchestrator?.cancelCurrentRequest()
 
         Logger.i(TAG, "Task cancelled, state transitioned: $transitioned, current state: ${_state.value}")
     }

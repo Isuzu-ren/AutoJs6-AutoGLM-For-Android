@@ -10,11 +10,17 @@ import com.kevinluo.autoglm.history.HistoryManager
 import com.kevinluo.autoglm.input.TextInputManager
 import com.kevinluo.autoglm.model.ModelClient
 import com.kevinluo.autoglm.model.ModelConfig
+import com.kevinluo.autoglm.planner.PlannerConfig
+import com.kevinluo.autoglm.planner.PlannerOrchestrator
+import com.kevinluo.autoglm.planner.deepseek.DeepSeekPlannerClient
+import com.kevinluo.autoglm.planner.tools.PlannerToolDispatcher
 import com.kevinluo.autoglm.screenshot.ScreenshotService
 import com.kevinluo.autoglm.settings.SettingsManager
 import com.kevinluo.autoglm.ui.FloatingWindowService
 import com.kevinluo.autoglm.util.HumanizedSwipeGenerator
 import com.kevinluo.autoglm.util.Logger
+import okhttp3.OkHttpClient
+import java.util.concurrent.TimeUnit
 
 /**
  * Centralized component manager for dependency injection and lifecycle management.
@@ -80,6 +86,11 @@ class ComponentManager private constructor(private val context: Context) {
     private var appResolverInternal: AppResolver? = null
     private var swipeGeneratorInternal: HumanizedSwipeGenerator? = null
 
+    // Planner components (DeepSeek)
+    private var plannerClientInternal: DeepSeekPlannerClient? = null
+    private var plannerOrchestratorInternal: PlannerOrchestrator? = null
+    private var plannerToolDispatcherInternal: PlannerToolDispatcher? = null
+
     /**
      * Checks if the UserService is connected.
      */
@@ -128,6 +139,15 @@ class ComponentManager private constructor(private val context: Context) {
         }
 
     /**
+     * PlannerOrchestrator (DeepSeek) instance.
+     * Only available when:
+     * - UserService connected (needs ScreenshotService)
+     * - PlannerConfig.enabled == true
+     */
+    val plannerOrchestrator: PlannerOrchestrator?
+        get() = plannerOrchestratorInternal
+
+    /**
      * Gets the AppResolver instance.
      */
     val appResolver: AppResolver
@@ -151,6 +171,9 @@ class ComponentManager private constructor(private val context: Context) {
 
     // Track current model config for change detection
     private var currentModelConfig: ModelConfig? = null
+
+    // Track current planner config for change detection (so toggling settings re-inits)
+    private var currentPlannerConfig: PlannerConfig? = null
 
     /**
      * Called when UserService connects.
@@ -211,7 +234,74 @@ class ComponentManager private constructor(private val context: Context) {
                 historyManager = historyManager,
             )
 
+        // Init planner (optional)
+        initializePlannerComponentsIfEnabled()
+
         Logger.i(TAG, "All service-dependent components initialized")
+    }
+
+    /**
+     * Initializes planner components if PlannerConfig.enabled is true.
+     *
+     * NOTE:
+     * - Planner uses its own config (PlannerConfig), independent from VLM ModelConfig.
+     * - Planner needs ScreenshotService + VLM ModelClient, so must be initialized after them.
+     */
+    private fun initializePlannerComponentsIfEnabled() {
+        val plannerConfig = settingsManager.getPlannerConfig()
+        val changed = currentPlannerConfig != plannerConfig
+        if (changed) currentPlannerConfig = plannerConfig
+
+        if (!plannerConfig.enabled) {
+            // ensure released
+            plannerClientInternal?.cancelCurrentRequest()
+            plannerClientInternal = null
+            plannerOrchestratorInternal = null
+            plannerToolDispatcherInternal = null
+            Logger.i(TAG, "Planner disabled; planner components cleared")
+            return
+        }
+
+        // Create / recreate if missing or config changed
+        if (plannerClientInternal == null || plannerOrchestratorInternal == null || plannerToolDispatcherInternal == null || changed) {
+            val httpClient =
+                OkHttpClient.Builder()
+                    .connectTimeout(30, TimeUnit.SECONDS)
+                    .readTimeout(120, TimeUnit.SECONDS)
+                    .writeTimeout(30, TimeUnit.SECONDS)
+                    .build()
+
+            plannerClientInternal =
+                DeepSeekPlannerClient(
+                    okHttpClient = httpClient,
+                    apiKeyProvider = { settingsManager.getPlannerConfig().apiKey },
+                    baseUrlProvider = { settingsManager.getPlannerConfig().baseUrl },
+                    modelProvider = { settingsManager.getPlannerConfig().modelName },
+                )
+
+            plannerToolDispatcherInternal =
+                PlannerToolDispatcher(
+                    screenshotService = requireNotNull(screenshotServiceInternal),
+                    vlmClient = modelClient,
+                )
+
+            // VLM system prompt：复用你原来 PhoneAgent 使用的 system prompt 提供函数即可
+            // 这里给一个最保守的默认值：用 SettingsManager 的 custom prompt + 或你现有默认 prompt。
+            // 由于我还没读 SystemPrompts 的实现，先把 provider 留给你在接入时改。
+            val vlmSystemPromptProvider: () -> String = {
+                // TODO: 替换为你现有生成 system prompt 的逻辑
+                settingsManager.getCustomSystemPrompt(settingsManager.getAgentConfig().language) ?: ""
+            }
+
+            plannerOrchestratorInternal =
+                PlannerOrchestrator(
+                    plannerClient = plannerClientInternal!!,
+                    toolDispatcher = plannerToolDispatcherInternal!!,
+                    vlmSystemPromptProvider = vlmSystemPromptProvider,
+                )
+
+            Logger.i(TAG, "Planner components initialized: model=${plannerConfig.modelName}, baseUrl=${plannerConfig.baseUrl}")
+        }
     }
 
     /**
@@ -224,6 +314,13 @@ class ComponentManager private constructor(private val context: Context) {
         screenshotServiceInternal = null
         textInputManagerInternal = null
         deviceExecutorInternal = null
+
+        // planner components also rely on screenshot service; clear them too
+        plannerClientInternal?.cancelCurrentRequest()
+        plannerClientInternal = null
+        plannerOrchestratorInternal = null
+        plannerToolDispatcherInternal = null
+        currentPlannerConfig = null
 
         Logger.i(TAG, "Service-dependent components cleaned up")
     }
@@ -265,6 +362,9 @@ class ComponentManager private constructor(private val context: Context) {
                 config = agentConfig,
                 historyManager = historyManager,
             )
+
+        // Re-init planner too (might have been enabled/disabled/changed)
+        initializePlannerComponentsIfEnabled()
 
         Logger.i(TAG, "PhoneAgent reinitialized with new configuration")
     }
@@ -324,5 +424,7 @@ class ComponentManager private constructor(private val context: Context) {
         appendLine("  - ModelClient: ${if (modelClientInternal != null) "initialized" else "null"}")
         appendLine("  - AppResolver: ${if (appResolverInternal != null) "initialized" else "null"}")
         appendLine("  - SwipeGenerator: ${if (swipeGeneratorInternal != null) "initialized" else "null"}")
+        appendLine("  - PlannerClient: ${if (plannerClientInternal != null) "initialized" else "null"}")
+        appendLine("  - PlannerOrchestrator: ${if (plannerOrchestratorInternal != null) "initialized" else "null"}")
     }
 }
