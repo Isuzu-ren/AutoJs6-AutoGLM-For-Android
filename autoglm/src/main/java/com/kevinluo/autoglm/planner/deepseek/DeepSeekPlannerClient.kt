@@ -9,6 +9,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 class DeepSeekPlannerClient(
     private val okHttpClient: OkHttpClient,
@@ -27,11 +29,11 @@ class DeepSeekPlannerClient(
      * This method is tool-calling aware: it returns tool_calls when present.
      */
     @Throws(IOException::class)
-    fun chat(
+    suspend fun chat(
         messages: List<DsMessage>,
         tools: List<DsTool>,
         temperature: Double = 0.2,
-    ): DsMessage {
+    ): DsMessage = withContext(Dispatchers.IO) {
         val url = baseUrlProvider().trimEnd('/') + "/chat/completions"
         val apiKey = apiKeyProvider()
 
@@ -57,31 +59,33 @@ class DeepSeekPlannerClient(
         val call = okHttpClient.newCall(request)
         currentCall.set(call)
 
-        val response =
-            call.execute().also {
-                currentCall.compareAndSet(call, null)
+        try {
+            call.execute().use { response ->
+                if (!response.isSuccessful) {
+                    val err = response.body?.string()
+                    throw IOException("DeepSeek API error: HTTP ${response.code}. body=$err")
+                }
+
+                val text = response.body?.string().orEmpty()
+                val json = JSONObject(text)
+
+                val choices = json.optJSONArray("choices") ?: JSONArray()
+                if (choices.length() == 0) {
+                    throw IOException("DeepSeek API returned no choices. body=$text")
+                }
+
+                val choice0 = choices.getJSONObject(0)
+                val msgJson =
+                    choice0.optJSONObject("message")
+                        ?: throw IOException("DeepSeek API response missing message. body=$text")
+
+                val dsMessage = msgJson.fromJsonToDsMessage()
+                Logger.d(TAG, "DeepSeek message role=${dsMessage.role}, tool_calls=${dsMessage.tool_calls?.size ?: 0}")
+                dsMessage
             }
-
-        if (!response.isSuccessful) {
-            val err = response.body?.string()
-            throw IOException("DeepSeek API error: HTTP ${response.code}. body=$err")
+        } finally {
+            currentCall.compareAndSet(call, null)
         }
-
-        val text = response.body?.string().orEmpty()
-        val json = JSONObject(text)
-
-        val choices = json.optJSONArray("choices") ?: JSONArray()
-        if (choices.length() == 0) {
-            throw IOException("DeepSeek API returned no choices. body=$text")
-        }
-
-        val choice0 = choices.getJSONObject(0)
-        val msgJson = choice0.optJSONObject("message")
-            ?: throw IOException("DeepSeek API response missing message. body=$text")
-
-        val dsMessage = msgJson.fromJsonToDsMessage()
-        Logger.d(TAG, "DeepSeek message role=${dsMessage.role}, tool_calls=${dsMessage.tool_calls?.size ?: 0}")
-        return dsMessage
     }
 
     private fun DsMessage.toJson(): JSONObject =
