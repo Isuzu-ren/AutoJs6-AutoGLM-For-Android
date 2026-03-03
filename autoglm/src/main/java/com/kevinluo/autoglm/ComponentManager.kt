@@ -224,6 +224,9 @@ class ComponentManager private constructor(private val context: Context) {
                 floatingWindowProvider = { FloatingWindowService.getInstance() },
             )
 
+        // Init planner (optional) before creating PhoneAgent so the orchestrator reference is ready
+        initializePlannerComponentsIfEnabled()
+
         // Create PhoneAgent
         val agentConfig = settingsManager.getAgentConfig()
         phoneAgentInternal =
@@ -235,9 +238,6 @@ class ComponentManager private constructor(private val context: Context) {
                 historyManager = historyManager,
                 plannerOrchestrator = plannerOrchestratorInternal,
             )
-
-        // Init planner (optional)
-        initializePlannerComponentsIfEnabled()
 
         Logger.i(TAG, "All service-dependent components initialized")
     }
@@ -351,6 +351,9 @@ class ComponentManager private constructor(private val context: Context) {
         // Recreate model client with new config
         modelClientInternal = null
 
+        // Re-init planner before PhoneAgent so the orchestrator reference is up-to-date
+        initializePlannerComponentsIfEnabled()
+
         // Recreate PhoneAgent
         val agentConfig = settingsManager.getAgentConfig()
         phoneAgentInternal =
@@ -362,9 +365,6 @@ class ComponentManager private constructor(private val context: Context) {
                 historyManager = historyManager,
                 plannerOrchestrator = plannerOrchestratorInternal,
             )
-
-        // Re-init planner too (might have been enabled/disabled/changed)
-        initializePlannerComponentsIfEnabled()
 
         Logger.i(TAG, "PhoneAgent reinitialized with new configuration")
     }
