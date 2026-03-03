@@ -495,6 +495,7 @@ class PhoneAgent(
         }
 
         return if (plannerOrchestrator != null) {
+            Logger.i(TAG, "Executing step via planner orchestrator")
             executeStepViaPlanner(plannerOrchestrator, task, hint, cancellationMsg)
         } else {
             executeStepViaVlmLegacy(ctx, task, hint, cancellationMsg)
