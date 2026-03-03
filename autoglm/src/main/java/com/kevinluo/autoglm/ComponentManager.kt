@@ -21,6 +21,7 @@ import com.kevinluo.autoglm.util.HumanizedSwipeGenerator
 import com.kevinluo.autoglm.util.Logger
 import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
+import com.kevinluo.autoglm.config.SystemPrompts
 
 /**
  * Centralized component manager for dependency injection and lifecycle management.
@@ -232,6 +233,7 @@ class ComponentManager private constructor(private val context: Context) {
                 screenshotService = screenshotServiceInternal!!,
                 config = agentConfig,
                 historyManager = historyManager,
+                plannerOrchestrator = plannerOrchestratorInternal,
             )
 
         // Init planner (optional)
@@ -285,12 +287,9 @@ class ComponentManager private constructor(private val context: Context) {
                     vlmClient = modelClient,
                 )
 
-            // VLM system prompt：复用你原来 PhoneAgent 使用的 system prompt 提供函数即可
-            // 这里给一个最保守的默认值：用 SettingsManager 的 custom prompt + 或你现有默认 prompt。
-            // 由于我还没读 SystemPrompts 的实现，先把 provider 留给你在接入时改。
             val vlmSystemPromptProvider: () -> String = {
-                // TODO: 替换为你现有生成 system prompt 的逻辑
-                settingsManager.getCustomSystemPrompt(settingsManager.getAgentConfig().language) ?: ""
+                val lang = settingsManager.getAgentConfig().language
+                SystemPrompts.getPrompt(lang)
             }
 
             plannerOrchestratorInternal =
@@ -361,6 +360,7 @@ class ComponentManager private constructor(private val context: Context) {
                 screenshotService = screenshotServiceInternal!!,
                 config = agentConfig,
                 historyManager = historyManager,
+                plannerOrchestrator = plannerOrchestratorInternal,
             )
 
         // Re-init planner too (might have been enabled/disabled/changed)

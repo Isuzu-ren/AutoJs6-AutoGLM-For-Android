@@ -112,7 +112,6 @@ class PlannerOrchestrator(
                                         JSONObject()
                                             .put("task", JSONObject().put("type", "string"))
                                             .put("hint", JSONObject().put("type", "string"))
-                                            .put("screenshotBase64", JSONObject().put("type", "string"))
                                             .put("forceFinishAllowed", JSONObject().put("type", "boolean").put("default", true)),
                                     )
                                     .put("required", org.json.JSONArray()),
@@ -131,7 +130,7 @@ class PlannerOrchestrator(
         messages += DsMessage(role = "system", content = PlannerPrompts.plannerCn())
         messages += DsMessage(role = "user", content = buildUserTaskText(task, hint))
 
-        var lastScreenshotBase64: String? = null
+        // var lastScreenshotBase64: String? = null
 
         repeat(maxPlannerTurns) { turn ->
             val assistant = plannerClient.chat(messages = messages, tools = tools)
@@ -151,13 +150,14 @@ class PlannerOrchestrator(
                 val argsText = tc.function.arguments
                 val args = runCatching { JSONObject(argsText.ifBlank { "{}" }) }.getOrElse { JSONObject() }
 
-                val toolResult =
+                val toolResult: PlannerToolDispatcher.ToolResult =
                     when (fnName) {
                         "get_screenshot" -> {
                             val reason = args.optString("reason", null)
-                            toolDispatcher.getScreenshot(reason).also {
-                                lastScreenshotBase64 = it.content.optString("base64Data", null)
-                            }
+                            // toolDispatcher.getScreenshot(reason).also {
+                            //     lastScreenshotBase64 = it.content.optString("base64Data", null)
+                            // }
+                            toolDispatcher.getScreenshot(reason)
                         }
 
                         "list_scripts" -> toolDispatcher.listScripts()
@@ -179,32 +179,62 @@ class PlannerOrchestrator(
                             val vlmTask = args.optString("task", task)
                             val vlmHint = args.optString("hint", null)
 
-                            // Prefer explicit screenshotBase64; otherwise use last captured screenshot.
-                            val screenshotBase64 =
-                                args.optString("screenshotBase64", null)
-                                    ?: lastScreenshotBase64
-
-                            if (screenshotBase64.isNullOrBlank()) {
-                                val err =
-                                    JSONObject()
-                                        .put("ok", false)
-                                        .put(
-                                            "error",
-                                            JSONObject()
-                                                .put("code", "MISSING_SCREENSHOT")
-                                                .put("message", "call_vlm_next_action requires screenshotBase64; call get_screenshot first."),
-                                        )
-                                PlannerToolDispatcher.ToolResult(false, err)
+                            // Planner never receives screenshot base64.
+                            // We capture screenshot internally and only send base64 to VLM.
+                            val screenshotRes = toolDispatcher.captureScreenshotBase64ForVlm(reason = "call_vlm_next_action")
+                            if (!screenshotRes.ok) {
+                                screenshotRes
                             } else {
-                                val vlmMessages = buildVlmMessages(vlmTask, vlmHint)
-                                val vlmRes = toolDispatcher.callVlmNextAction(vlmMessages, screenshotBase64)
+                                val screenshotBase64 = screenshotRes.content.optString("base64Data", "").trim()
+                                if (screenshotBase64.isBlank()) {
+                                    val err =
+                                        JSONObject()
+                                            .put("ok", false)
+                                            .put(
+                                                "error",
+                                                JSONObject()
+                                                    .put("code", "MISSING_SCREENSHOT")
+                                                    .put("message", "Failed to capture screenshot for VLM."),
+                                            )
+                                    PlannerToolDispatcher.ToolResult(false, err)
+                                } else {
+                                    val vlmMessages = buildVlmMessages(vlmTask, vlmHint)
+                                    val vlmRes = toolDispatcher.callVlmNextAction(vlmMessages, screenshotBase64)
 
-                                val actionDsl = vlmRes.content.optString("actionDsl", "").trim()
-                                if (vlmRes.ok && actionDsl.isNotBlank()) {
-                                    return PlannerStepOutput(ok = true, nextActionDsl = actionDsl, debug = "turn=$turn via VLM")
+                                    val actionDsl = vlmRes.content.optString("actionDsl", "").trim()
+                                    if (vlmRes.ok && actionDsl.isNotBlank()) {
+                                        return PlannerStepOutput(ok = true, nextActionDsl = actionDsl, debug = "turn=$turn via VLM")
+                                    }
+                                    vlmRes
                                 }
-                                vlmRes
                             }
+
+                            // // Prefer explicit screenshotBase64; otherwise use last captured screenshot.
+                            // val screenshotBase64 =
+                            //     args.optString("screenshotBase64", null)
+                            //         ?: lastScreenshotBase64
+                            //
+                            // if (screenshotBase64.isNullOrBlank()) {
+                            //     val err =
+                            //         JSONObject()
+                            //             .put("ok", false)
+                            //             .put(
+                            //                 "error",
+                            //                 JSONObject()
+                            //                     .put("code", "MISSING_SCREENSHOT")
+                            //                     .put("message", "call_vlm_next_action requires screenshotBase64; call get_screenshot first."),
+                            //             )
+                            //     PlannerToolDispatcher.ToolResult(false, err)
+                            // } else {
+                            //     val vlmMessages = buildVlmMessages(vlmTask, vlmHint)
+                            //     val vlmRes = toolDispatcher.callVlmNextAction(vlmMessages, screenshotBase64)
+                            //
+                            //     val actionDsl = vlmRes.content.optString("actionDsl", "").trim()
+                            //     if (vlmRes.ok && actionDsl.isNotBlank()) {
+                            //         return PlannerStepOutput(ok = true, nextActionDsl = actionDsl, debug = "turn=$turn via VLM")
+                            //     }
+                            //     vlmRes
+                            // }
                         }
 
                         else -> {
@@ -237,7 +267,7 @@ class PlannerOrchestrator(
             if (!hint.isNullOrBlank()) {
                 append("\n上一步结果：").append(hint)
             }
-            append("\n请根据需要调用工具：脚本优先；需要 UI 操作时先 get_screenshot 再 call_vlm_next_action。")
+            append("\n请根据需要调用工具：脚本优先；需要 UI 操作时直接 call_vlm_next_action（内部会截图）；只有需要获取屏幕尺寸/敏感标记等元信息时才调用 get_screenshot。")
         }
     }
 
