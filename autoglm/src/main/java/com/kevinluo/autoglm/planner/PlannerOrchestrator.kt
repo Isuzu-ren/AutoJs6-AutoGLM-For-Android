@@ -130,7 +130,7 @@ class PlannerOrchestrator(
         messages += DsMessage(role = "system", content = PlannerPrompts.plannerCn())
         messages += DsMessage(role = "user", content = buildUserTaskText(task, hint))
 
-        var lastScreenshotBase64: String? = null
+        // var lastScreenshotBase64: String? = null
 
         repeat(maxPlannerTurns) { turn ->
             val assistant = plannerClient.chat(messages = messages, tools = tools)
@@ -150,13 +150,14 @@ class PlannerOrchestrator(
                 val argsText = tc.function.arguments
                 val args = runCatching { JSONObject(argsText.ifBlank { "{}" }) }.getOrElse { JSONObject() }
 
-                val toolResult =
+                val toolResult: PlannerToolDispatcher.ToolResult =
                     when (fnName) {
                         "get_screenshot" -> {
                             val reason = args.optString("reason", null)
-                            toolDispatcher.getScreenshot(reason).also {
-                                lastScreenshotBase64 = it.content.optString("base64Data", null)
-                            }
+                            // toolDispatcher.getScreenshot(reason).also {
+                            //     lastScreenshotBase64 = it.content.optString("base64Data", null)
+                            // }
+                            toolDispatcher.getScreenshot(reason)
                         }
 
                         "list_scripts" -> toolDispatcher.listScripts()
@@ -266,7 +267,7 @@ class PlannerOrchestrator(
             if (!hint.isNullOrBlank()) {
                 append("\n上一步结果：").append(hint)
             }
-            append("\n请根据需要调用工具：脚本优先；需要 UI 操作时先 get_screenshot 再 call_vlm_next_action。")
+            append("\n请根据需要调用工具：脚本优先；需要 UI 操作时直接 call_vlm_next_action（内部会截图）；只有需要获取屏幕尺寸/敏感标记等元信息时才调用 get_screenshot。")
         }
     }
 
