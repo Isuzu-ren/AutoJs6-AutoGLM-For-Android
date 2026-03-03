@@ -232,6 +232,7 @@ class ComponentManager private constructor(private val context: Context) {
                 screenshotService = screenshotServiceInternal!!,
                 config = agentConfig,
                 historyManager = historyManager,
+                plannerOrchestrator = plannerOrchestratorInternal,
             )
 
         // Init planner (optional)
@@ -361,6 +362,7 @@ class ComponentManager private constructor(private val context: Context) {
                 screenshotService = screenshotServiceInternal!!,
                 config = agentConfig,
                 historyManager = historyManager,
+                plannerOrchestrator = plannerOrchestratorInternal,
             )
 
         // Re-init planner too (might have been enabled/disabled/changed)

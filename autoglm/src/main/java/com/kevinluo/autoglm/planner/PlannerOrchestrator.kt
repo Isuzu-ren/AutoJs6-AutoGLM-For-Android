@@ -112,7 +112,6 @@ class PlannerOrchestrator(
                                         JSONObject()
                                             .put("task", JSONObject().put("type", "string"))
                                             .put("hint", JSONObject().put("type", "string"))
-                                            .put("screenshotBase64", JSONObject().put("type", "string"))
                                             .put("forceFinishAllowed", JSONObject().put("type", "boolean").put("default", true)),
                                     )
                                     .put("required", org.json.JSONArray()),
@@ -179,32 +178,62 @@ class PlannerOrchestrator(
                             val vlmTask = args.optString("task", task)
                             val vlmHint = args.optString("hint", null)
 
-                            // Prefer explicit screenshotBase64; otherwise use last captured screenshot.
-                            val screenshotBase64 =
-                                args.optString("screenshotBase64", null)
-                                    ?: lastScreenshotBase64
-
-                            if (screenshotBase64.isNullOrBlank()) {
-                                val err =
-                                    JSONObject()
-                                        .put("ok", false)
-                                        .put(
-                                            "error",
-                                            JSONObject()
-                                                .put("code", "MISSING_SCREENSHOT")
-                                                .put("message", "call_vlm_next_action requires screenshotBase64; call get_screenshot first."),
-                                        )
-                                PlannerToolDispatcher.ToolResult(false, err)
+                            // Planner never receives screenshot base64.
+                            // We capture screenshot internally and only send base64 to VLM.
+                            val screenshotRes = toolDispatcher.captureScreenshotBase64ForVlm(reason = "call_vlm_next_action")
+                            if (!screenshotRes.ok) {
+                                screenshotRes
                             } else {
-                                val vlmMessages = buildVlmMessages(vlmTask, vlmHint)
-                                val vlmRes = toolDispatcher.callVlmNextAction(vlmMessages, screenshotBase64)
+                                val screenshotBase64 = screenshotRes.content.optString("base64Data", "").trim()
+                                if (screenshotBase64.isBlank()) {
+                                    val err =
+                                        JSONObject()
+                                            .put("ok", false)
+                                            .put(
+                                                "error",
+                                                JSONObject()
+                                                    .put("code", "MISSING_SCREENSHOT")
+                                                    .put("message", "Failed to capture screenshot for VLM."),
+                                            )
+                                    PlannerToolDispatcher.ToolResult(false, err)
+                                } else {
+                                    val vlmMessages = buildVlmMessages(vlmTask, vlmHint)
+                                    val vlmRes = toolDispatcher.callVlmNextAction(vlmMessages, screenshotBase64)
 
-                                val actionDsl = vlmRes.content.optString("actionDsl", "").trim()
-                                if (vlmRes.ok && actionDsl.isNotBlank()) {
-                                    return PlannerStepOutput(ok = true, nextActionDsl = actionDsl, debug = "turn=$turn via VLM")
+                                    val actionDsl = vlmRes.content.optString("actionDsl", "").trim()
+                                    if (vlmRes.ok && actionDsl.isNotBlank()) {
+                                        return PlannerStepOutput(ok = true, nextActionDsl = actionDsl, debug = "turn=$turn via VLM")
+                                    }
+                                    vlmRes
                                 }
-                                vlmRes
                             }
+
+                            // // Prefer explicit screenshotBase64; otherwise use last captured screenshot.
+                            // val screenshotBase64 =
+                            //     args.optString("screenshotBase64", null)
+                            //         ?: lastScreenshotBase64
+                            //
+                            // if (screenshotBase64.isNullOrBlank()) {
+                            //     val err =
+                            //         JSONObject()
+                            //             .put("ok", false)
+                            //             .put(
+                            //                 "error",
+                            //                 JSONObject()
+                            //                     .put("code", "MISSING_SCREENSHOT")
+                            //                     .put("message", "call_vlm_next_action requires screenshotBase64; call get_screenshot first."),
+                            //             )
+                            //     PlannerToolDispatcher.ToolResult(false, err)
+                            // } else {
+                            //     val vlmMessages = buildVlmMessages(vlmTask, vlmHint)
+                            //     val vlmRes = toolDispatcher.callVlmNextAction(vlmMessages, screenshotBase64)
+                            //
+                            //     val actionDsl = vlmRes.content.optString("actionDsl", "").trim()
+                            //     if (vlmRes.ok && actionDsl.isNotBlank()) {
+                            //         return PlannerStepOutput(ok = true, nextActionDsl = actionDsl, debug = "turn=$turn via VLM")
+                            //     }
+                            //     vlmRes
+                            // }
                         }
 
                         else -> {

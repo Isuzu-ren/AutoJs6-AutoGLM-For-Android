@@ -29,6 +29,19 @@ class PlannerToolDispatcher(
                 .put("originalWidth", s.originalWidth)
                 .put("originalHeight", s.originalHeight)
                 .put("isSensitive", s.isSensitive)
+        return ToolResult(true, json)
+    }
+
+    suspend fun captureScreenshotBase64ForVlm(reason: String? = null): ToolResult {
+        val s = screenshotService.capture()
+        val json =
+            JSONObject()
+                .put("ok", true)
+                .put("width", s.width)
+                .put("height", s.height)
+                .put("originalWidth", s.originalWidth)
+                .put("originalHeight", s.originalHeight)
+                .put("isSensitive", s.isSensitive)
                 .put("base64Data", s.base64Data)
         return ToolResult(true, json)
     }

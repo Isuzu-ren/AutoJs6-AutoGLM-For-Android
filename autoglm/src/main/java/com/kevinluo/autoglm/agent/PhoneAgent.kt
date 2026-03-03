@@ -1115,10 +1115,11 @@ Please re-analyze the current screenshot and output correct coordinates (within 
 
             return result
         } catch (e: Exception) {
+            val wasCancelled = (_state.value == AgentState.CANCELLED)
             _state.value = AgentState.IDLE
 
             // Check if cancelled
-            if (_state.value == AgentState.CANCELLED) {
+            if (wasCancelled) {
                 return StepResult(
                     success = false,
                     finished = true,
@@ -1171,6 +1172,7 @@ Please re-analyze the current screenshot and output correct coordinates (within 
 
         // Cancel any ongoing model request
         modelClient.cancelCurrentRequest()
+        plannerOrchestrator?.cancelCurrentRequest()
 
         // Clear state
         context.get()?.reset()
